@@ -12,10 +12,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-POLICY_DOCUMENT       = "policies.md"   # swap this to use a different document
+POLICY_DOCUMENT       = "policies.md"  
 MODEL                 = "gpt-3.5-turbo"
 MAX_TOKENS            = 512
-CONTEXT_WINDOW        = 600             # artificially small to trigger compression quickly
+CONTEXT_WINDOW        = 600            
 COMPRESSION_THRESHOLD = 0.6             # compress when history hits this fraction of window
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -50,23 +50,31 @@ def count_tokens(messages: list[dict]) -> int:
         total += len(_encoder.encode(msg["content"]))
     return total
 
-
 def summarize_history(client: OpenAI, history: list[dict]) -> list[dict]:
+    """Call the LLM to compress history into a single summary message."""
+    
     """
-    Call the LLM to compress history into a single summary message.
-    Returns a one-element list containing a single assistant message with the summary.
-
-    TODO: implement this function.
-      1. Build a transcript string from history (role + content for each message).
-      2. Call client.chat.completions.create() with a system prompt that tells the
-         model to summarize the conversation concisely. Key facts may be lost — that
-         is intentional and is the point of this exercise.
-      3. Return [{"role": "assistant", "content": "[Summary of earlier conversation]: <summary>"}]
+    TODO:
+     1. Build a transcript string from history (role + content for each message).
     """
-    raise NotImplementedError("TODO: implement summarize_history()")
+    transcript = ''
+    response = client.chat.completions.create(
+        model      = MODEL,
+        max_tokens = 300,
+        messages   = [
+            {
+                "role": "system",
+                # "content": (
+                    # TODO: Write a system prompt to summarize the conversation
+                    # ),
+            },
+            {"role": "user", "content": transcript},
+        ],
+    )
+    summary = response.choices[0].message.content
+    return [{"role": "assistant", "content": f"[Summary of earlier conversation]: {summary}"}]
 
-
-def maybe_compress(client: OpenAI, history: list[dict]) -> tuple[list[dict], bool]:
+def should_compress(client: OpenAI, history: list[dict]) -> tuple[list[dict], bool]:
     """
     Check token count and compress history if over threshold.
     Returns (history, did_compress).
@@ -81,7 +89,7 @@ def maybe_compress(client: OpenAI, history: list[dict]) -> tuple[list[dict], boo
 
 
 def chat(client: OpenAI, system: str, history: list[dict], user_input: str) -> tuple[str, list[dict], bool]:
-    history, compressed = maybe_compress(client, history)
+    history, compressed = should_compress(client, history)
     messages = [{"role": "system", "content": system}] + history + [{"role": "user", "content": user_input}]
 
     response = client.chat.completions.create(
