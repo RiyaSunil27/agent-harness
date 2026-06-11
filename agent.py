@@ -1,6 +1,8 @@
 """
-FAQ Agent — base version.
-No context management. Full history sent every turn.
+FAQ Agent — sliding window context.
+Only the last N message pairs are sent to the model.
+Problem: ask about something outside the window and the agent forgets.
+Exercise: increase WINDOW_SIZE and see how more context helps recall.
 """
 
 from openai import OpenAI
@@ -12,6 +14,7 @@ load_dotenv()
 POLICY_DOCUMENT = "policies.md"   # swap this to use a different document
 MODEL           = "gpt-3.5-turbo"
 MAX_TOKENS      = 512
+WINDOW_SIZE     = 1               # keep last N user+assistant pairs — try increasing this!
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -35,8 +38,15 @@ Policy information takes precedence if there is a conflict.
 --- END DOCUMENT ---"""
 
 
+def trim_history(history: list[dict], window_size: int) -> list[dict]:
+    """Sliding window: keep only the last `window_size` user+assistant pairs."""
+    keep = window_size * 2
+    return history[-keep:] if len(history) > keep else history
+
+
 def chat(client: OpenAI, system: str, history: list[dict], user_input: str) -> str:
-    messages = [{"role": "system", "content": system}] + history + [{"role": "user", "content": user_input}]
+    windowed = trim_history(history, WINDOW_SIZE)
+    messages  = [{"role": "system", "content": system}] + windowed + [{"role": "user", "content": user_input}]
 
     response = client.chat.completions.create(
         model      = MODEL,
@@ -52,9 +62,10 @@ def main():
     system   = build_system_prompt(document)
     history: list[dict] = []
 
-    print("=== FAQ Agent ===")
+    print("=== FAQ Agent (Sliding Window) ===")
     print(f"Policy document : {POLICY_DOCUMENT}")
     print(f"Model           : {MODEL}")
+    print(f"Window size     : {WINDOW_SIZE} pair(s)  ← change WINDOW_SIZE to see the difference")
     print("Type 'quit' to exit.\n")
 
     while True:
@@ -70,7 +81,7 @@ def main():
         history.append({"role": "assistant", "content": reply})
 
         print(f"\nAgent: {reply}\n")
-        print(f"[history: {len(history)} messages]\n")
+        print(f"[history: {len(history)} messages total | sending last {WINDOW_SIZE * 2} to model]\n")
 
 
 if __name__ == "__main__":
