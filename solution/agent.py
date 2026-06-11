@@ -1,8 +1,5 @@
 """
-FAQ Agent — token-threshold lossy summarization.
-When history tokens exceed a threshold, the LLM compresses history into a summary.
-Problem: summarization is lossy — earlier details may not survive.
-Exercise: implement summarize_history() and maybe_compress() below.
+FAQ Agent — token-threshold lossy summarization (SOLUTION).
 """
 
 import tiktoken
@@ -52,32 +49,35 @@ def count_tokens(messages: list[dict]) -> int:
 
 
 def summarize_history(client: OpenAI, history: list[dict]) -> list[dict]:
-    """
-    Call the LLM to compress history into a single summary message.
-    Returns a one-element list containing a single assistant message with the summary.
-
-    TODO: implement this function.
-      1. Build a transcript string from history (role + content for each message).
-      2. Call client.chat.completions.create() with a system prompt that tells the
-         model to summarize the conversation concisely. Key facts may be lost — that
-         is intentional and is the point of this exercise.
-      3. Return [{"role": "assistant", "content": "[Summary of earlier conversation]: <summary>"}]
-    """
-    raise NotImplementedError("TODO: implement summarize_history()")
+    """Call the LLM to compress history into a single summary message."""
+    transcript = "\n".join(
+        f"{m['role'].upper()}: {m['content']}" for m in history
+    )
+    response = client.chat.completions.create(
+        model      = MODEL,
+        max_tokens = 300,
+        messages   = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a conversation summarizer. Summarize the conversation below "
+                    "into a short paragraph. Capture key facts the user shared and questions "
+                    "they asked. Be concise — details may be lost."
+                ),
+            },
+            {"role": "user", "content": transcript},
+        ],
+    )
+    summary = response.choices[0].message.content
+    return [{"role": "assistant", "content": f"[Summary of earlier conversation]: {summary}"}]
 
 
 def maybe_compress(client: OpenAI, history: list[dict]) -> tuple[list[dict], bool]:
-    """
-    Check token count and compress history if over threshold.
-    Returns (history, did_compress).
-
-    TODO: implement this function.
-      1. Compute the token budget: CONTEXT_WINDOW * COMPRESSION_THRESHOLD (cast to int).
-      2. If count_tokens(history) >= token_budget, call summarize_history() and return
-         (summary, True).
-      3. Otherwise return (history, False).
-    """
-    raise NotImplementedError("TODO: implement maybe_compress()")
+    """Return (possibly compressed history, did_compress)."""
+    token_budget = int(CONTEXT_WINDOW * COMPRESSION_THRESHOLD)
+    if count_tokens(history) >= token_budget:
+        return summarize_history(client, history), True
+    return history, False
 
 
 def chat(client: OpenAI, system: str, history: list[dict], user_input: str) -> tuple[str, list[dict], bool]:
