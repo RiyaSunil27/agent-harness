@@ -1,3 +1,5 @@
 openai
 python-dotenv
 tiktoken
+flask
+flask-cors
