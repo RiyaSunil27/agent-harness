@@ -46,14 +46,6 @@ After 10-20 exchanges, you're sending thousands of tokens that are just repetiti
 - After msg 2: 754 total (143 history)
 - After msg 3: 823 total (212 history)
 
-## Solution Ideas
-
-The agent harness in `agent-harness/` explores several approaches:
-- Context windowing (keep only last N messages)
-- Summarization (compress old context)
-- Semantic search (retrieve only relevant messages)
-- Hierarchical memory (semantic + token counting)
-
 ## Files
 
 - `agent.py` — Original CLI agent (full history sent every turn)
