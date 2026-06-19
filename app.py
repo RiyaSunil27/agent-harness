@@ -1,12 +1,9 @@
-"""
-Backend API for FAQ Agent with context visualization.
-Exposes chat endpoint + context metrics.
-"""
-
+import importlib.util
+import os
+import tiktoken
+from pathlib import Path
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from openai import OpenAI
-import tiktoken
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -14,22 +11,30 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
-# ── Configuration ──────────────────────────────────────────────────────────────
-POLICY_DOCUMENT = "policies.md"
-MODEL = "gpt-3.5-turbo"
-MAX_TOKENS = 512
-WINDOW_SIZE = 1   # keep last N user+assistant pairs
-# ──────────────────────────────────────────────────────────────────────────────
+POLICY_DOCUMENT  = "policies.md"
+current_exercise = 1  # switched via POST /api/switch
 
-client = OpenAI()
-enc = tiktoken.encoding_for_model(MODEL)
-conversation_history = []
+try:
+    enc = tiktoken.encoding_for_model(os.getenv("LITELLM_MODEL", "gpt-4o-mini"))
+except Exception:
+    enc = tiktoken.get_encoding("cl100k_base")
+
+conversation_history: list = []
+last_compressed: bool = False
 
 
-def trim_history(history: list, window_size: int) -> list:
-    keep = window_size * 2
-    return history[-keep:] if len(history) > keep else history
+# ── Exercise loader ────────────────────────────────────────────────────────────
 
+def get_exercise_module():
+    """Reload exercise file from disk on every call — student edits take effect immediately."""
+    path = Path(__file__).parent / f"exercise_{current_exercise}.py"
+    spec = importlib.util.spec_from_file_location(f"exercise_{current_exercise}", path)
+    mod  = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def load_document(path: str) -> str:
     try:
@@ -39,832 +44,753 @@ def load_document(path: str) -> str:
         return "# No policy document found\n\nPlease create a policies.md file."
 
 
-def build_system_prompt(document: str) -> str:
-    return f"""You are a helpful HR assistant.
-
-You should:
-- Answer policy questions using the policy document.
-- Remember information the user tells you during the conversation.
-- Use both the conversation history and the policy document when answering.
-
-Policy information takes precedence if there is a conflict.
-
---- POLICY DOCUMENT ---
-{document}
---- END DOCUMENT ---"""
+def count_tokens_text(text: str) -> int:
+    return len(enc.encode(text)) if text else 0
 
 
-def count_tokens(text: str) -> int:
-    return len(enc.encode(text))
+def count_tokens_msgs(messages: list) -> int:
+    total = 0
+    for msg in messages:
+        total += 4
+        content = msg.get("content") or ""
+        if isinstance(content, str):
+            total += count_tokens_text(content)
+    return total
 
 
-def get_context_info(last_user_message=None):
-    """Build context info for visualization."""
-    document = load_document(POLICY_DOCUMENT)
-    system_prompt = build_system_prompt(document)
+def serialize_msg(msg: dict, truncate_len: int = 200) -> dict:
+    role    = msg.get("role", "unknown")
+    content = msg.get("content") or ""
+    if role == "assistant" and not content and msg.get("tool_calls"):
+        names   = [tc.get("function", {}).get("name", "?") for tc in msg["tool_calls"]]
+        content = f"[Tool call: {', '.join(names)}]"
+    is_offloaded = isinstance(content, str) and content.startswith("[offloaded to disk:")
+    short = content[:truncate_len] + "..." if len(content) > truncate_len else content
+    return {
+        "role":         role,
+        "content":      short,
+        "tokens":       count_tokens_text(content),
+        "is_tool":      role == "tool",
+        "is_offloaded": is_offloaded,
+    }
 
-    windowed_history = trim_history(conversation_history, WINDOW_SIZE)
 
-    system_tokens = count_tokens(system_prompt)
-    windowed_tokens = sum(count_tokens(msg["content"]) for msg in windowed_history)
-    total_tokens = system_tokens + windowed_tokens
+def _trim_for_display(meta: dict, history: list) -> list:
+    ws = meta.get("window_size", 0)
+    if ws == 0:
+        return history
+    user_indices = [i for i, m in enumerate(history) if m.get("role") == "user"]
+    if len(user_indices) <= ws:
+        return history
+    cutoff = user_indices[-ws]
+    return history[cutoff:]
 
-    def truncate(text, max_len=200):
-        return text[:max_len] + "..." if len(text) > max_len else text
 
-    # Full payload = exactly what was sent to LLM (windowed, not full history)
-    payload_messages = [{"role": "system", "content": system_prompt}] + windowed_history
-    if last_user_message:
-        payload_messages = payload_messages + [{"role": "user", "content": last_user_message}]
+def get_context_info(user_input: str = None) -> dict:
+    mod           = get_exercise_module()
+    meta          = mod.EXERCISE_META
+    document      = load_document(POLICY_DOCUMENT)
+    system_prompt = mod.build_system_prompt(document)
 
-    full_payload_tokens = sum(count_tokens(m["content"]) for m in payload_messages)
+    windowed    = _trim_for_display(meta, conversation_history)
+    sys_tok     = count_tokens_text(system_prompt)
+    hist_tok    = count_tokens_msgs(windowed)
+
+    payload = [{"role": "system", "content": system_prompt}] + windowed
+    if user_input:
+        payload.append({"role": "user", "content": user_input})
+    payload_tok = count_tokens_msgs(payload)
+
+    tool_results_dir = getattr(mod, "TOOL_RESULTS_DIR", "tool_results")
+    tool_msgs        = [m for m in conversation_history if m.get("role") == "tool"]
+    offloaded        = [m for m in tool_msgs if str(m.get("content", "")).startswith("[offloaded to disk:")]
+    offloaded_files  = len(os.listdir(tool_results_dir)) if os.path.isdir(tool_results_dir) else 0
+
+    user_count          = sum(1 for m in conversation_history if m.get("role") == "user")
+    windowed_user_count = sum(1 for m in windowed if m.get("role") == "user")
+
+    context_window        = meta.get("context_window") or 800
+    compression_threshold = meta.get("compression_threshold")
 
     return {
-        "system_prompt": truncate(system_prompt, 300),
-        "system_prompt_full": system_prompt,
-        "system_tokens": system_tokens,
-        "conversation": [
-            {
-                "role": msg["role"],
-                "content": truncate(msg["content"]),
-                "tokens": count_tokens(msg["content"])
-            }
-            for msg in conversation_history
-        ],
-        "windowed_conversation": [
-            {
-                "role": msg["role"],
-                "content": truncate(msg["content"]),
-                "tokens": count_tokens(msg["content"])
-            }
-            for msg in windowed_history
-        ],
-        "history_tokens": windowed_tokens,
-        "total_history_messages": len(conversation_history),
-        "windowed_history_messages": len(windowed_history),
-        "total_tokens": total_tokens,
-        "max_tokens": MAX_TOKENS,
-        "message_count": len(conversation_history),
-        "window_size": WINDOW_SIZE,
+        "exercise_number":           meta["number"],
+        "features":                  meta.get("features", []),
+        "system_tokens":             sys_tok,
+        "history_tokens":            hist_tok,
+        "full_payload_tokens":       payload_tok,
+        "context_window":            context_window,
+        "compression_threshold":     int(compression_threshold * 100) if compression_threshold else None,
+        "window_size":               meta.get("window_size", 0),
+        "total_history_messages":    len(conversation_history),
+        "windowed_history_messages": len(windowed),
+        "total_turns":               user_count,
+        "windowed_turns":            windowed_user_count,
+        "tool_msg_count":            len(tool_msgs),
+        "offloaded_count":           len(offloaded),
+        "offloaded_files_on_disk":   offloaded_files,
+        "compressed_last_turn":      last_compressed,
+        "conversation":              [serialize_msg(m) for m in conversation_history],
+        "windowed_conversation":     [serialize_msg(m) for m in windowed],
         "full_payload": [
-            {
-                "role": m["role"],
-                "content": m["content"],
-                "tokens": count_tokens(m["content"])
-            }
-            for m in payload_messages
+            {"role": m["role"], "content": m.get("content") or "", "tokens": count_tokens_text(m.get("content") or "")}
+            for m in payload
         ],
-        "full_payload_tokens": full_payload_tokens,
     }
+
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
+
+@app.route("/api/exercise")
+def exercise_endpoint():
+    mod = get_exercise_module()
+    return jsonify(mod.EXERCISE_META)
+
+
+@app.route("/api/switch", methods=["POST"])
+def switch_exercise():
+    global current_exercise, conversation_history, last_compressed
+    num = int(request.json.get("exercise", 1))
+    if num not in (1, 2, 3):
+        return jsonify({"error": "exercise must be 1, 2, or 3"}), 400
+    current_exercise     = num
+    conversation_history = []
+    last_compressed      = False
+    mod  = get_exercise_module()
+    meta = mod.EXERCISE_META
+    return jsonify({"exercise": num, "meta": meta})
 
 
 @app.route("/api/chat", methods=["POST"])
 def chat_endpoint():
-    """Process user message and return response + context."""
-    data = request.json
+    global conversation_history, last_compressed
+    data       = request.json
     user_input = data.get("message", "").strip()
-
     if not user_input:
         return jsonify({"error": "Empty message"}), 400
 
-    document = load_document(POLICY_DOCUMENT)
-    system_prompt = build_system_prompt(document)
-
-    # Build messages: system + windowed history + new message
-    windowed = trim_history(conversation_history, WINDOW_SIZE)
-    messages = [{"role": "system", "content": system_prompt}] + windowed + [
-        {"role": "user", "content": user_input}
-    ]
-
     try:
-        response = client.chat.completions.create(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            messages=messages,
-        )
-        assistant_reply = response.choices[0].message.content
+        mod      = get_exercise_module()
+        document = load_document(POLICY_DOCUMENT)
+        system   = mod.build_system_prompt(document)
+        reply, conversation_history, metadata = mod.chat(system, conversation_history, user_input)
+        last_compressed = metadata.get("compressed", False)
+    except NotImplementedError as e:
+        return jsonify({"error": str(e), "is_todo": True}), 501
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e), "is_todo": False}), 500
 
-    # Capture context BEFORE appending (payload = what was actually sent)
-    context = get_context_info(last_user_message=user_input)
-
-    conversation_history.append({"role": "user", "content": user_input})
-    conversation_history.append({"role": "assistant", "content": assistant_reply})
-
-    # Update message count to reflect post-append state
-    context["message_count"] = len(conversation_history)
-
-    return jsonify({
-        "reply": assistant_reply,
-        "context": context,
-    })
+    context = get_context_info()
+    return jsonify({"reply": reply, "context": context})
 
 
 @app.route("/api/context", methods=["GET"])
 def context_endpoint():
-    """Get current context info."""
     return jsonify(get_context_info())
 
 
 @app.route("/api/clear", methods=["POST"])
 def clear_endpoint():
-    """Clear conversation history."""
-    global conversation_history
+    global conversation_history, last_compressed
     conversation_history = []
+    last_compressed      = False
     return jsonify({"status": "cleared"})
 
 
 @app.route("/", methods=["GET"])
 def index():
-    """Serve frontend."""
-    return """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>FAQ Agent — Context Visualization</title>
-        <style>
-            * {
-                margin: 0;
-                padding: 0;
-                box-sizing: border-box;
-            }
+    return r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FAQ Agent — Context Visualization</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
 
-            body {
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-                background: #fafafa;
-                height: 100vh;
-                overflow: hidden;
-            }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: #0d0d0d;
+            color: #e8e8e8;
+            height: 100vh;
+            overflow: hidden;
+        }
 
-            .container {
-                display: flex;
-                height: 100vh;
-            }
+        .container { display: flex; height: 100vh; }
 
-            .sidebar {
-                width: 350px;
-                background: #f5f5f5;
-                border-right: 1px solid #e0e0e0;
-                display: flex;
-                flex-direction: column;
-                overflow-y: auto;
-            }
+        /* ── Sidebar ───────────────────────────────────────────────────────── */
+        .sidebar {
+            width: 360px;
+            background: #1a1a1a;
+            border-right: 1px solid #333;
+            display: flex;
+            flex-direction: column;
+            overflow-y: auto;
+        }
 
-            .sidebar-header {
-                padding: 16px;
-                border-bottom: 1px solid #e0e0e0;
-                background: white;
-                font-weight: 600;
-                color: #333;
-                position: sticky;
-                top: 0;
-                z-index: 10;
-            }
+        .sidebar-header {
+            padding: 14px 16px;
+            border-bottom: 1px solid #333;
+            background: #252525;
+            font-weight: 600;
+            color: #e8e8e8;
+            font-size: 13px;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
 
-            .sidebar-section {
-                padding: 12px;
-                border-bottom: 1px solid #e0e0e0;
-            }
+        .sidebar-section { padding: 12px; border-bottom: 1px solid #333; }
 
-            .section-title {
-                font-size: 12px;
-                font-weight: 700;
-                color: #666;
-                text-transform: uppercase;
-                margin-bottom: 8px;
-                letter-spacing: 0.5px;
-            }
+        .section-title {
+            font-size: 11px; font-weight: 700; color: #b0b0b0;
+            text-transform: uppercase; margin-bottom: 8px; letter-spacing: 0.5px;
+        }
 
-            .metric {
-                display: flex;
-                justify-content: space-between;
-                margin: 6px 0;
-                font-size: 13px;
-            }
+        .metric { display: flex; justify-content: space-between; margin: 6px 0; font-size: 12px; }
+        .metric-label { color: #a0a0a0; }
+        .metric-value { font-weight: 600; color: #e8e8e8; font-family: "Monaco", monospace; font-size: 12px; }
+        .metric-value.warn  { color: #ffb74d; }
+        .metric-value.good  { color: #81c784; }
+        .metric-value.muted { color: #808080; }
 
-            .metric-label {
-                color: #555;
-            }
+        .progress-bar { width: 100%; height: 5px; background: #333; border-radius: 3px; margin-top: 4px; overflow: hidden; }
+        .progress-fill { height: 100%; background: linear-gradient(90deg, #81c784, #ffb74d); transition: width 0.3s ease; }
 
-            .metric-value {
-                font-weight: 600;
-                color: #333;
-                font-family: "Monaco", monospace;
-            }
+        .badge { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 10px; font-weight: 600; text-transform: uppercase; }
+        .badge-dropped   { background: #5d1f1f; color: #ff9999; }
+        .badge-tool      { background: #1a3a52; color: #64b5f6; }
+        .badge-offloaded { background: #1d4d2f; color: #81c784; }
 
-            .progress-bar {
-                width: 100%;
-                height: 6px;
-                background: #e0e0e0;
-                border-radius: 3px;
-                margin-top: 4px;
-                overflow: hidden;
-            }
+        .message-item { background: #252525; padding: 7px; margin: 3px 0; border-radius: 4px; border-left: 3px solid #404040; font-size: 11px; }
+        .message-item.user      { border-left-color: #64b5f6; }
+        .message-item.assistant { border-left-color: #81c784; }
+        .message-item.tool      { border-left-color: #ce93d8; }
 
-            .progress-fill {
-                height: 100%;
-                background: linear-gradient(90deg, #4CAF50, #FFC107);
-                transition: width 0.3s ease;
-            }
+        .message-role    { font-weight: 700; font-size: 10px; text-transform: uppercase; color: #b0b0b0; margin-bottom: 3px; }
+        .message-content { color: #e8e8e8; line-height: 1.3; word-break: break-word; font-family: monospace; font-size: 10px; }
+        .message-tokens  { font-size: 10px; color: #808080; margin-top: 3px; }
 
-            .message-item {
-                background: white;
-                padding: 8px;
-                margin: 4px 0;
-                border-radius: 4px;
-                border-left: 3px solid #ddd;
-                font-size: 12px;
-            }
+        .system-prompt {
+            background: #2a2a2a; padding: 7px; border-radius: 4px; border-left: 3px solid #ffb74d;
+            font-family: monospace; font-size: 10px; color: #b0b0b0; line-height: 1.3;
+            max-height: 110px; overflow-y: auto;
+        }
 
-            .message-item.user {
-                border-left-color: #2196F3;
-            }
+        .section-header { display: flex; justify-content: space-between; align-items: center; }
+        .expand-btn { background: none; border: none; color: #808080; cursor: pointer; padding: 0; font-size: 14px; }
+        .expand-btn:hover { color: #b0b0b0; }
 
-            .message-item.assistant {
-                border-left-color: #4CAF50;
-            }
+        /* ── Exercise panel ──────────────────────────────────────────────── */
+        .exercise-panel {
+            background: #1a237e; color: white;
+            padding: 13px 14px; border-bottom: 2px solid #0d1450;
+        }
 
-            .message-role {
-                font-weight: 600;
-                font-size: 11px;
-                text-transform: uppercase;
-                color: #666;
-                margin-bottom: 4px;
-            }
+        .exercise-number {
+            font-size: 10px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 1px; color: #90caf9; margin-bottom: 3px;
+        }
 
-            .message-content {
-                color: #333;
-                line-height: 1.3;
-                word-break: break-word;
-                font-family: monospace;
-                font-size: 11px;
-            }
+        .exercise-title  { font-size: 14px; font-weight: 700; color: white; margin-bottom: 7px; }
+        .exercise-row    { font-size: 11px; color: #b3c5f5; margin-bottom: 4px; line-height: 1.4; }
+        .exercise-row strong { color: #e3f2fd; }
 
-            .message-tokens {
-                font-size: 10px;
-                color: #999;
-                margin-top: 4px;
-            }
+        .todo-chip {
+            display: inline-block; background: #e65100; color: white;
+            font-family: monospace; font-size: 10px; padding: 2px 7px;
+            border-radius: 3px; margin: 2px 2px 0 0;
+        }
 
-            .chat-container {
-                flex: 1;
-                display: flex;
-                flex-direction: column;
-                background: white;
-            }
+        /* ── Chat ────────────────────────────────────────────────────────── */
+        .chat-container { flex: 1; display: flex; flex-direction: column; background: #121212; }
 
-            .chat-header {
-                padding: 16px;
-                border-bottom: 1px solid #e0e0e0;
-                background: white;
-            }
+        .chat-header { padding: 0 16px; border-bottom: 1px solid #333; background: #1a1a1a; }
 
-            .chat-header h1 {
-                font-size: 18px;
-                color: #333;
-            }
+        .tab-row {
+            display: flex; gap: 4px; padding: 10px 0 0;
+        }
 
-            .chat-body {
-                flex: 1;
-                overflow-y: auto;
-                padding: 16px;
-                display: flex;
-                flex-direction: column;
-                gap: 12px;
-            }
+        .tab-btn {
+            padding: 7px 16px;
+            border: 1px solid #404040;
+            border-bottom: none;
+            background: #252525;
+            color: #a0a0a0;
+            border-radius: 6px 6px 0 0;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 500;
+            transition: background 0.15s, color 0.15s;
+        }
 
-            .chat-message {
-                display: flex;
-                gap: 12px;
-                animation: fadeIn 0.3s ease;
-            }
+        .tab-btn:hover { background: #333; color: #d0d0d0; }
 
-            @keyframes fadeIn {
-                from {
-                    opacity: 0;
-                    transform: translateY(10px);
-                }
-                to {
-                    opacity: 1;
-                    transform: translateY(0);
-                }
-            }
+        .tab-btn.active {
+            background: #1a1a1a;
+            color: #64b5f6;
+            font-weight: 700;
+            border-color: #555;
+            border-bottom: 2px solid #1a1a1a;
+            position: relative;
+            top: 1px;
+        }
 
-            .chat-message.user {
-                justify-content: flex-end;
-            }
+        .tab-divider { height: 1px; background: #333; }
 
-            .message-bubble {
-                max-width: 60%;
-                padding: 12px 16px;
-                border-radius: 8px;
-                word-wrap: break-word;
-                line-height: 1.4;
-            }
+        .chat-subheader { padding: 8px 0 10px; font-size: 12px; color: #808080; }
 
-            .message-bubble.user {
-                background: #2196F3;
-                color: white;
-                border-radius: 8px 2px 8px 8px;
-            }
+        .chat-body {
+            flex: 1; overflow-y: auto; padding: 16px;
+            display: flex; flex-direction: column; gap: 12px;
+        }
 
-            .message-bubble.assistant {
-                background: #f0f0f0;
-                color: #333;
-                border-radius: 2px 8px 8px 8px;
-            }
+        .chat-message { display: flex; gap: 12px; animation: fadeIn 0.25s ease; }
+        .chat-message.user { justify-content: flex-end; }
 
-            .chat-input-area {
-                padding: 16px;
-                border-top: 1px solid #e0e0e0;
-                background: white;
-                display: flex;
-                gap: 8px;
-            }
+        @keyframes fadeIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
 
-            .chat-input {
-                flex: 1;
-                padding: 10px 12px;
-                border: 1px solid #ddd;
-                border-radius: 4px;
-                font-size: 14px;
-                font-family: inherit;
-            }
+        .message-bubble {
+            max-width: 60%; padding: 11px 15px; border-radius: 8px;
+            word-wrap: break-word; line-height: 1.45; font-size: 14px;
+        }
 
-            .chat-input:focus {
-                outline: none;
-                border-color: #2196F3;
-                box-shadow: 0 0 0 2px rgba(33, 150, 243, 0.1);
-            }
+        .message-bubble.user      { background: #1565c0; color: white; border-radius: 8px 2px 8px 8px; }
+        .message-bubble.assistant { background: #2a2a2a; color: #e8e8e8; border-radius: 2px 8px 8px 8px; }
+        .message-bubble.error {
+            background: #3d2a1f; color: #ffb74d; border-radius: 6px;
+            font-size: 13px; border: 1px solid #cc8844; max-width: 80%;
+            font-family: monospace; line-height: 1.5;
+        }
 
-            button {
-                padding: 10px 20px;
-                background: #2196F3;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                cursor: pointer;
-                font-weight: 600;
-                font-size: 14px;
-                transition: background 0.2s;
-            }
+        .chat-input-area { padding: 14px 16px; border-top: 1px solid #333; background: #1a1a1a; display: flex; gap: 8px; }
 
-            button:hover {
-                background: #1976D2;
-            }
+        .chat-input {
+            flex: 1; padding: 10px 12px; border: 1px solid #404040;
+            border-radius: 4px; font-size: 14px; font-family: inherit;
+            background: #252525; color: #e8e8e8;
+        }
 
-            button:active {
-                transform: scale(0.98);
-            }
+        .chat-input:focus { outline: none; border-color: #64b5f6; box-shadow: 0 0 0 2px rgba(100,181,246,.2); }
 
-            button.secondary {
-                background: #666;
-                padding: 6px 12px;
-                font-size: 12px;
-            }
+        .chat-input::placeholder { color: #808080; }
 
-            button.secondary:hover {
-                background: #555;
-            }
+        button {
+            padding: 10px 20px; background: #1565c0; color: white; border: none;
+            border-radius: 4px; cursor: pointer; font-weight: 600; font-size: 14px; transition: background .2s;
+        }
+        button:hover { background: #1976d2; }
 
-            .loading {
-                opacity: 0.6;
-                pointer-events: none;
-            }
+        button.secondary { background: #555; padding: 6px 12px; font-size: 12px; }
+        button.secondary:hover { background: #666; }
 
-            .spinner {
-                display: inline-block;
-                width: 12px;
-                height: 12px;
-                border: 2px solid rgba(255,255,255,.3);
-                border-radius: 50%;
-                border-top-color: white;
-                animation: spin 0.6s linear infinite;
-            }
+        .spinner {
+            display: inline-block; width: 12px; height: 12px;
+            border: 2px solid rgba(255,255,255,.3); border-radius: 50%;
+            border-top-color: white; animation: spin .6s linear infinite;
+        }
 
-            @keyframes spin {
-                to { transform: rotate(360deg); }
-            }
+        @keyframes spin { to { transform: rotate(360deg); } }
 
-            .system-prompt {
-                background: white;
-                padding: 8px;
-                border-radius: 4px;
-                border-left: 3px solid #FF9800;
-                font-family: monospace;
-                font-size: 10px;
-                color: #555;
-                line-height: 1.3;
-                max-height: 120px;
-                overflow-y: auto;
-            }
+        /* ── Modal ───────────────────────────────────────────────────────── */
+        .modal {
+            display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,.8); z-index: 1000; align-items: center; justify-content: center;
+        }
+        .modal.active { display: flex; }
 
-            .sidebar::-webkit-scrollbar,
-            .chat-body::-webkit-scrollbar,
-            .system-prompt::-webkit-scrollbar {
-                width: 6px;
-            }
+        .modal-content {
+            background: #1a1a1a; border-radius: 8px; width: 90%; max-width: 600px;
+            max-height: 80vh; display: flex; flex-direction: column;
+            box-shadow: 0 10px 40px rgba(0,0,0,.6);
+        }
 
-            .sidebar::-webkit-scrollbar-track,
-            .chat-body::-webkit-scrollbar-track,
-            .system-prompt::-webkit-scrollbar-track {
-                background: transparent;
-            }
+        .modal-header {
+            padding: 14px 16px; border-bottom: 1px solid #333;
+            display: flex; justify-content: space-between; align-items: center;
+            font-weight: 600; color: #e8e8e8;
+        }
 
-            .sidebar::-webkit-scrollbar-thumb,
-            .chat-body::-webkit-scrollbar-thumb,
-            .system-prompt::-webkit-scrollbar-thumb {
-                background: #ccc;
-                border-radius: 3px;
-            }
+        .modal-body {
+            flex: 1; overflow-y: auto; padding: 16px;
+            font-family: monospace; font-size: 12px; color: #b0b0b0; line-height: 1.5;
+        }
 
-            .sidebar::-webkit-scrollbar-thumb:hover,
-            .chat-body::-webkit-scrollbar-thumb:hover,
-            .system-prompt::-webkit-scrollbar-thumb:hover {
-                background: #999;
-            }
+        .modal-close { background: none; border: none; color: #808080; cursor: pointer; font-size: 22px; padding: 0; }
+        .modal-close:hover { color: #d0d0d0; }
 
-            .section-header {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                gap: 8px;
-            }
+        ::-webkit-scrollbar { width: 5px; }
+        ::-webkit-scrollbar-track { background: #1a1a1a; }
+        ::-webkit-scrollbar-thumb { background: #555; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #777; }
+    </style>
+</head>
+<body>
+<div class="container">
 
-            .expand-btn {
-                background: none;
-                border: none;
-                color: #666;
-                cursor: pointer;
-                padding: 0;
-                width: 16px;
-                height: 16px;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                font-size: 14px;
-                line-height: 1;
-                transition: color 0.2s;
-            }
+    <!-- ── Sidebar ─────────────────────────────────────────────────────────── -->
+    <div class="sidebar">
+        <div class="sidebar-header">Context Inspector</div>
 
-            .expand-btn:hover {
-                color: #333;
-            }
+        <div class="exercise-panel">
+            <div class="exercise-number" id="exNumber">Exercise —</div>
+            <div class="exercise-title"  id="exTitle">Loading…</div>
+            <div class="exercise-row"><strong>Strategy:</strong> <span id="exStrategy"></span></div>
+            <div class="exercise-row"><strong>Problem:</strong>  <span id="exProblem"></span></div>
+            <div class="exercise-row" style="margin-top:6px;"><strong>Your task:</strong></div>
+            <div class="exercise-row" id="exTask"></div>
+            <div id="exTodos" style="margin-top:6px;"></div>
+        </div>
 
-            .modal {
-                display: none;
-                position: fixed;
-                top: 0;
-                left: 0;
-                right: 0;
-                bottom: 0;
-                background: rgba(0, 0, 0, 0.5);
-                z-index: 1000;
-                align-items: center;
-                justify-content: center;
-            }
-
-            .modal.active {
-                display: flex;
-            }
-
-            .modal-content {
-                background: white;
-                border-radius: 8px;
-                width: 90%;
-                max-width: 600px;
-                max-height: 80vh;
-                display: flex;
-                flex-direction: column;
-                box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
-            }
-
-            .modal-header {
-                padding: 16px;
-                border-bottom: 1px solid #e0e0e0;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                font-weight: 600;
-                color: #333;
-            }
-
-            .modal-body {
-                flex: 1;
-                overflow-y: auto;
-                padding: 16px;
-                font-family: monospace;
-                font-size: 12px;
-                color: #555;
-                line-height: 1.5;
-                white-space: pre-wrap;
-                word-wrap: break-word;
-            }
-
-            .modal-close {
-                background: none;
-                border: none;
-                color: #999;
-                cursor: pointer;
-                font-size: 20px;
-                padding: 0;
-                width: 32px;
-                height: 32px;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                transition: color 0.2s;
-            }
-
-            .modal-close:hover {
-                color: #333;
-            }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="sidebar" id="sidebar">
-                <div class="sidebar-header">Context Info</div>
-                <div class="sidebar-section">
-                    <div class="section-title">Token Usage</div>
-                    <div class="metric">
-                        <span class="metric-label">System Prompt:</span>
-                        <span class="metric-value" id="systemTokens">0</span>
-                    </div>
-                    <div class="metric">
-                        <span class="metric-label">Windowed History:</span>
-                        <span class="metric-value" id="historyTokens">0</span>
-                    </div>
-                    <div class="metric">
-                        <span class="metric-label">Payload Total:</span>
-                        <span class="metric-value" id="payloadTokens">0</span>
-                    </div>
-                    <div class="metric">
-                        <span class="metric-label">Max per response:</span>
-                        <span class="metric-value" id="maxTokens">512</span>
-                    </div>
-                    <div style="margin-top: 8px;">
-                        <div style="font-size: 10px; color: #666;">Progress to max</div>
-                        <div class="progress-bar">
-                            <div class="progress-fill" id="progressFill" style="width: 0%"></div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="sidebar-section">
-                    <div class="section-title">Sliding Window</div>
-                    <div class="metric">
-                        <span class="metric-label">Window size:</span>
-                        <span class="metric-value" id="windowSize">1</span>
-                    </div>
-                    <div class="metric">
-                        <span class="metric-label">Total messages stored:</span>
-                        <span class="metric-value" id="messageCount">0</span>
-                    </div>
-                    <div class="metric">
-                        <span class="metric-label">Sent to LLM:</span>
-                        <span class="metric-value" id="windowedCount">0</span>
-                    </div>
-                    <div class="metric">
-                        <span class="metric-label">Dropped:</span>
-                        <span class="metric-value" id="droppedCount" style="color: #e53935;">0</span>
-                    </div>
-                </div>
-
-                <div class="sidebar-section">
-                    <div class="section-header">
-                        <div class="section-title">Payload Sent to LLM</div>
-                        <button class="expand-btn" onclick="openSystemPromptModal()" title="Expand">⤢</button>
-                    </div>
-                    <div style="font-size: 11px; color: #888; margin-bottom: 6px;">system + windowed history + user message</div>
-                    <div class="system-prompt" id="systemPrompt"></div>
-                </div>
-
-                <div class="sidebar-section">
-                    <div class="section-title">Full Conversation History <span style="font-size:10px; font-weight:400; color:#888;">(stored, not all sent)</span></div>
-                    <div id="historyList"></div>
-                </div>
-
-                <div class="sidebar-section">
-                    <button class="secondary" onclick="clearHistory()">Clear History</button>
-                </div>
+        <div class="sidebar-section">
+            <div class="section-title">Token Usage</div>
+            <div class="metric"><span class="metric-label">System prompt</span><span class="metric-value" id="systemTokens">0</span></div>
+            <div class="metric"><span class="metric-label">History (windowed)</span><span class="metric-value" id="historyTokens">0</span></div>
+            <div class="metric"><span class="metric-label">Payload total</span><span class="metric-value" id="payloadTokens">0</span></div>
+            <div class="metric"><span class="metric-label">Context window</span><span class="metric-value" id="contextWindow">—</span></div>
+            <div style="margin-top:6px;">
+                <div style="font-size:10px;color:#888;margin-bottom:2px;">History vs context window</div>
+                <div class="progress-bar"><div class="progress-fill" id="progressFill" style="width:0%"></div></div>
+                <div style="font-size:10px;color:#aaa;margin-top:2px;" id="progressPct">0%</div>
             </div>
+        </div>
 
-            <div class="chat-container">
-                <div class="chat-header">
-                    <h1>FAQ Agent — Full Context Sent Every Message</h1>
-                </div>
-                <div class="chat-body" id="chatBody">
-                    <div class="chat-message">
-                        <div class="message-bubble assistant">
-                            Hi! I'm an HR assistant. Ask me about company policies or employee benefits.
-                        </div>
-                    </div>
-                </div>
-                <div class="chat-input-area">
-                    <input
-                        type="text"
-                        class="chat-input"
-                        id="chatInput"
-                        placeholder="Ask a question..."
-                        onkeypress="handleEnter(event)"
-                    >
-                    <button id="sendBtn" onclick="sendMessage(this)">Send</button>
+        <div class="sidebar-section" id="sectionSlidingWindow">
+            <div class="section-title">Sliding Window</div>
+            <div class="metric"><span class="metric-label">Window size</span><span class="metric-value" id="windowSize">—</span></div>
+            <div class="metric"><span class="metric-label">Total turns stored</span><span class="metric-value" id="totalTurns">0</span></div>
+            <div class="metric"><span class="metric-label">Turns sent to LLM</span><span class="metric-value" id="windowedTurns">0</span></div>
+            <div class="metric"><span class="metric-label">Turns dropped</span><span class="metric-value warn" id="droppedTurns">0</span></div>
+        </div>
+
+        <div class="sidebar-section" id="sectionSummarization">
+            <div class="section-title">Summarization</div>
+            <div class="metric"><span class="metric-label">Threshold</span><span class="metric-value" id="compressionThreshold">—</span></div>
+            <div class="metric"><span class="metric-label">Compressed last turn</span><span class="metric-value" id="compressedLastTurn">—</span></div>
+        </div>
+
+        <div class="sidebar-section" id="sectionToolOffloading">
+            <div class="section-title">Tool Output Offloading</div>
+            <div class="metric"><span class="metric-label">Tool messages</span><span class="metric-value" id="toolMsgCount">0</span></div>
+            <div class="metric"><span class="metric-label">Offloaded (stubs)</span><span class="metric-value good" id="offloadedCount">0</span></div>
+            <div class="metric"><span class="metric-label">Files on disk</span><span class="metric-value" id="offloadedFiles">0</span></div>
+        </div>
+
+        <div class="sidebar-section">
+            <div class="section-header">
+                <div class="section-title">Payload Sent to LLM</div>
+                <button class="expand-btn" onclick="openPayloadModal()" title="Expand">⤢</button>
+            </div>
+            <div style="font-size:10px;color:#999;margin-bottom:5px;">system + windowed history + user message</div>
+            <div class="system-prompt" id="payloadPreview"></div>
+        </div>
+
+        <div class="sidebar-section">
+            <div class="section-title">Full Conversation History
+                <span style="font-weight:400;color:#aaa;font-size:10px;">(not all sent to LLM)</span>
+            </div>
+            <div id="historyList"></div>
+        </div>
+
+        <div class="sidebar-section">
+            <button class="secondary" onclick="clearHistory()">Clear History</button>
+        </div>
+    </div>
+
+    <!-- ── Chat ─────────────────────────────────────────────────────────────── -->
+    <div class="chat-container">
+        <div class="chat-header">
+            <div class="tab-row">
+                <button class="tab-btn active" id="tab1" onclick="switchExercise(1)">Exercise 1 — Sliding Window</button>
+                <button class="tab-btn"         id="tab2" onclick="switchExercise(2)">Exercise 2 — Summarization</button>
+                <button class="tab-btn"         id="tab3" onclick="switchExercise(3)">Exercise 3 — Tool Offloading</button>
+            </div>
+            <div class="tab-divider"></div>
+            <div class="chat-subheader" id="chatHint">Loading…</div>
+        </div>
+
+        <div class="chat-body" id="chatBody">
+            <div class="chat-message">
+                <div class="message-bubble assistant">
+                    Hi! I'm an HR assistant. How can i help you?.
                 </div>
             </div>
         </div>
 
-        <!-- Full Payload Modal -->
-        <div class="modal" id="systemPromptModal" onclick="closeSystemPromptModal(event)">
-            <div class="modal-content" onclick="event.stopPropagation()">
-                <div class="modal-header">
-                    <span>Full Payload Sent to LLM</span>
-                    <button class="modal-close" onclick="closeSystemPromptModal()">×</button>
-                </div>
-                <div class="modal-body" id="systemPromptFull"></div>
-            </div>
+        <div class="chat-input-area">
+            <input type="text" class="chat-input" id="chatInput"
+                   placeholder="Ask a question…" onkeypress="handleEnter(event)">
+            <button id="sendBtn" onclick="sendMessage()">Send</button>
         </div>
+    </div>
+</div>
 
-        <script>
-            const API_BASE = window.location.origin;
-            let fullPayload = [];
+<!-- Payload modal -->
+<div class="modal" id="payloadModal" onclick="closePayloadModal(event)">
+    <div class="modal-content" onclick="event.stopPropagation()">
+        <div class="modal-header">
+            <span>Full Payload Sent to LLM</span>
+            <button class="modal-close" onclick="closePayloadModal()">×</button>
+        </div>
+        <div class="modal-body" id="payloadFull"></div>
+    </div>
+</div>
 
-            function openSystemPromptModal() {
-                document.getElementById("systemPromptModal").classList.add("active");
-                const body = document.getElementById("systemPromptFull");
-                body.innerHTML = "";
-                fullPayload.forEach((msg, i) => {
-                    const wrapper = document.createElement("div");
-                    wrapper.style.cssText = "margin-bottom: 16px; border-left: 3px solid " +
-                        (msg.role === "system" ? "#FF9800" : msg.role === "user" ? "#2196F3" : "#4CAF50") +
-                        "; padding-left: 10px;";
-                    wrapper.innerHTML =
-                        '<div style="font-weight:700; font-size:11px; text-transform:uppercase; color:#888; margin-bottom:4px;">' +
-                        escapeHtml(msg.role) + ' <span style="font-weight:400; color:#bbb;">(' + msg.tokens + ' tokens)</span></div>' +
-                        '<pre style="margin:0; white-space:pre-wrap; word-wrap:break-word; font-family:monospace; font-size:12px; color:#444; line-height:1.5;">' +
-                        escapeHtml(msg.content) + '</pre>';
-                    body.appendChild(wrapper);
-                });
-            }
+<script>
+    const API = window.location.origin;
+    let fullPayload = [];
 
-            function closeSystemPromptModal(event) {
-                if (event && event.target.id !== "systemPromptModal") return;
-                document.getElementById("systemPromptModal").classList.remove("active");
-            }
+    // ── Tab switching ─────────────────────────────────────────────────────────
+    async function switchExercise(num) {
+        const res  = await fetch(API + "/api/switch", {
+            method:  "POST",
+            headers: {"Content-Type": "application/json"},
+            body:    JSON.stringify({exercise: num}),
+        });
+        const data = await res.json();
+        [1, 2, 3].forEach(n => document.getElementById("tab" + n).classList.toggle("active", n === num));
+        resetChatBody();
+        applyExerciseMeta(data.meta);
+        resetContextDisplay();
+    }
 
-            // Close modal on escape key
-            document.addEventListener("keydown", (e) => {
-                if (e.key === "Escape") closeSystemPromptModal();
+    function applyExerciseMeta(meta) {
+        document.getElementById("exNumber").textContent   = "Exercise " + meta.number;
+        document.getElementById("exTitle").textContent    = meta.title;
+        document.getElementById("exStrategy").textContent = meta.strategy;
+        document.getElementById("exProblem").textContent  = meta.problem;
+        document.getElementById("exTask").textContent     = meta.task;
+
+        var hints = {
+            1: "Try mentioning your employee ID, then ask about it again 3+ turns later.",
+            2: "Chat for a while — watch the sidebar when compression triggers.",
+            3: "Ask: \"What is the leave balance for EMP001?\" or \"How many people are in Engineering?\"",
+        };
+        document.getElementById("chatHint").textContent = hints[meta.number] || "";
+
+        var todosEl = document.getElementById("exTodos");
+        if (meta.todos && meta.todos.length > 0) {
+            todosEl.innerHTML = meta.todos
+                .map(function(t) { return "<span class=\"todo-chip\">" + escapeHtml(t) + "</span>"; })
+                .join(" ");
+        } else {
+            todosEl.innerHTML = "<span style=\"font-size:11px;color:#a5d6a7;\">No TODOs — observe and experiment!</span>";
+        }
+
+        toggleSections(meta.features || []);
+    }
+
+    function toggleSections(features) {
+        document.getElementById("sectionSlidingWindow").style.display  = features.indexOf("sliding_window")  >= 0 ? "" : "none";
+        document.getElementById("sectionSummarization").style.display  = features.indexOf("summarization")   >= 0 ? "" : "none";
+        document.getElementById("sectionToolOffloading").style.display = features.indexOf("tool_offloading") >= 0 ? "" : "none";
+    }
+
+    // ── Chat ──────────────────────────────────────────────────────────────────
+    async function sendMessage() {
+        var input   = document.getElementById("chatInput");
+        var btn     = document.getElementById("sendBtn");
+        var message = input.value.trim();
+        if (!message) return;
+
+        addMessageToChat("user", message);
+        input.value = "";
+        input.focus();
+
+        btn.disabled  = true;
+        btn.innerHTML = "<span class=\"spinner\"></span>";
+
+        try {
+            var response = await fetch(API + "/api/chat", {
+                method:  "POST",
+                headers: {"Content-Type": "application/json"},
+                body:    JSON.stringify({message: message}),
             });
+            var data = await response.json();
 
-            async function sendMessage(btn) {
-                const input = document.getElementById("chatInput");
-                const message = input.value.trim();
-
-                if (!message) return;
-
-                const button = btn || document.getElementById("sendBtn");
-                const originalText = button.textContent;
-
-                addMessageToChat("user", message);
-                input.value = "";
-                input.focus();
-
-                button.disabled = true;
-                button.innerHTML = '<span class="spinner"></span>';
-
-                try {
-                    const response = await fetch(`${API_BASE}/api/chat`, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ message }),
-                    });
-
-                    const data = await response.json();
-
-                    if (response.ok) {
-                        addMessageToChat("assistant", data.reply);
-                        updateContext(data.context);
-                    } else {
-                        addMessageToChat("assistant", `Error: ${data.error}`);
-                    }
-                } catch (error) {
-                    addMessageToChat("assistant", `Error: ${error.message}`);
-                } finally {
-                    button.disabled = false;
-                    button.textContent = originalText;
-                }
+            if (response.status === 501) {
+                addErrorToChat(data.error);
+            } else if (response.ok) {
+                addMessageToChat("assistant", data.reply);
+                updateContext(data.context);
+            } else {
+                addErrorToChat("Server error: " + data.error);
             }
+        } catch (err) {
+            addErrorToChat("Network error: " + err.message);
+        } finally {
+            btn.disabled    = false;
+            btn.textContent = "Send";
+        }
+    }
 
-            function addMessageToChat(role, content) {
-                const chatBody = document.getElementById("chatBody");
-                const messageDiv = document.createElement("div");
-                messageDiv.className = `chat-message ${role}`;
+    function addMessageToChat(role, content) {
+        var chatBody = document.getElementById("chatBody");
+        var div      = document.createElement("div");
+        div.className = "chat-message " + role;
+        var bubble    = document.createElement("div");
+        bubble.className  = "message-bubble " + role;
+        bubble.textContent = content;
+        div.appendChild(bubble);
+        chatBody.appendChild(div);
+        chatBody.scrollTop = chatBody.scrollHeight;
+    }
 
-                const bubble = document.createElement("div");
-                bubble.className = `message-bubble ${role}`;
-                bubble.textContent = content;
+    function addErrorToChat(msg) {
+        var chatBody = document.getElementById("chatBody");
+        var div      = document.createElement("div");
+        div.className = "chat-message";
+        var bubble    = document.createElement("div");
+        bubble.className = "message-bubble error";
+        bubble.innerHTML =
+            "<strong>TODO not implemented yet</strong><br><br>" +
+            escapeHtml(msg) +
+            "<br><br>Implement the function(s) shown in the sidebar, then send again.";
+        div.appendChild(bubble);
+        chatBody.appendChild(div);
+        chatBody.scrollTop = chatBody.scrollHeight;
+    }
 
-                messageDiv.appendChild(bubble);
-                chatBody.appendChild(messageDiv);
-                chatBody.scrollTop = chatBody.scrollHeight;
-            }
+    // ── Context display ───────────────────────────────────────────────────────
+    function updateContext(ctx) {
+        document.getElementById("systemTokens").textContent  = ctx.system_tokens.toLocaleString();
+        document.getElementById("historyTokens").textContent = ctx.history_tokens.toLocaleString();
+        document.getElementById("payloadTokens").textContent = ctx.full_payload_tokens.toLocaleString();
+        document.getElementById("contextWindow").textContent = ctx.context_window ? ctx.context_window.toLocaleString() : "—";
+        document.getElementById("windowSize").textContent    = ctx.window_size || "—";
+        document.getElementById("totalTurns").textContent    = ctx.total_turns;
+        document.getElementById("windowedTurns").textContent = ctx.windowed_turns;
+        document.getElementById("droppedTurns").textContent  = ctx.total_turns - ctx.windowed_turns;
 
-            function updateContext(context) {
-                document.getElementById("systemTokens").textContent = context.system_tokens.toLocaleString();
-                document.getElementById("historyTokens").textContent = context.history_tokens.toLocaleString();
-                document.getElementById("payloadTokens").textContent = (context.full_payload_tokens || 0).toLocaleString();
-                document.getElementById("messageCount").textContent = context.total_history_messages || context.message_count;
-                document.getElementById("windowedCount").textContent = context.windowed_history_messages || 0;
-                document.getElementById("windowSize").textContent = context.window_size || 1;
-                const dropped = (context.total_history_messages || 0) - (context.windowed_history_messages || 0);
-                document.getElementById("droppedCount").textContent = dropped;
+        var ct = ctx.compression_threshold;
+        document.getElementById("compressionThreshold").textContent = ct != null ? ct + "%" : "—";
+        document.getElementById("toolMsgCount").textContent   = ctx.tool_msg_count;
+        document.getElementById("offloadedCount").textContent = ctx.offloaded_count;
+        document.getElementById("offloadedFiles").textContent = ctx.offloaded_files_on_disk;
 
-                const progress = Math.min(100, (context.full_payload_tokens / context.max_tokens) * 100);
-                document.getElementById("progressFill").style.width = progress + "%";
+        var compressed = ctx.compressed_last_turn;
+        var compEl     = document.getElementById("compressedLastTurn");
+        compEl.textContent = compressed ? "Yes" : "No";
+        compEl.className   = "metric-value " + (compressed ? "warn" : "muted");
 
-                fullPayload = context.full_payload || [];
-                const preview = fullPayload.map(m =>
-                    "[" + m.role.toUpperCase() + "]\\n" + m.content.substring(0, 80) + (m.content.length > 80 ? "..." : "")
-                ).join("\\n\\n");
-                document.getElementById("systemPrompt").textContent = preview;
+        var pct = ctx.context_window
+            ? Math.min(100, Math.round(ctx.history_tokens / ctx.context_window * 100))
+            : 0;
+        document.getElementById("progressFill").style.width = pct + "%";
+        document.getElementById("progressPct").textContent  = pct + "%";
 
-                // Full history — grey out messages not in windowed payload
-                const windowedCount = context.windowed_history_messages || 0;
-                const conversation = context.conversation || [];
-                const droppedCount = conversation.length - windowedCount;
-                const historyList = document.getElementById("historyList");
-                historyList.innerHTML = conversation.map((msg, i) => {
-                    const isDropped = i < droppedCount;
-                    return `<div class="message-item ${msg.role}" style="${isDropped ? "opacity:0.35; text-decoration: line-through;" : ""}">
-                        <div class="message-role">${msg.role}${isDropped ? " <span style=\\"color:#e53935;font-weight:400;\\">(dropped)</span>" : ""}</div>
-                        <div class="message-content">${escapeHtml(msg.content)}</div>
-                        <div class="message-tokens">${msg.tokens} tokens</div>
-                    </div>`;
-                }).join("");
-            }
+        fullPayload = ctx.full_payload || [];
+        var preview = fullPayload.map(function(m) {
+            return "[" + m.role.toUpperCase() + "]\n" +
+                (m.content || "").substring(0, 80) + ((m.content || "").length > 80 ? "..." : "");
+        }).join("\n\n");
+        document.getElementById("payloadPreview").textContent = preview;
 
-            function escapeHtml(text) {
-                const div = document.createElement("div");
-                div.textContent = text;
-                return div.innerHTML;
-            }
+        var conversation  = ctx.conversation || [];
+        var windowedCount = ctx.windowed_history_messages || 0;
+        var droppedCount  = conversation.length - windowedCount;
+        document.getElementById("historyList").innerHTML = conversation.map(function(msg, i) {
+            var isDropped   = i < droppedCount;
+            var isTool      = msg.is_tool;
+            var isOffloaded = msg.is_offloaded;
+            var badges = "";
+            if (isDropped)   badges += " <span class=\"badge badge-dropped\">dropped</span>";
+            if (isTool)      badges += " <span class=\"badge badge-tool\">tool</span>";
+            if (isOffloaded) badges += " <span class=\"badge badge-offloaded\">offloaded</span>";
+            return "<div class=\"message-item " + msg.role + "\" style=\"" + (isDropped ? "opacity:.35;" : "") + "\">" +
+                "<div class=\"message-role\">" + msg.role + badges + "</div>" +
+                "<div class=\"message-content\">" + escapeHtml(msg.content) + "</div>" +
+                "<div class=\"message-tokens\">" + msg.tokens + " tokens</div>" +
+                "</div>";
+        }).join("");
 
-            async function clearHistory() {
-                if (!confirm("Clear conversation history?")) return;
+        if (ctx.features) toggleSections(ctx.features);
+    }
 
-                try {
-                    await fetch(`${API_BASE}/api/clear`, { method: "POST" });
-                    document.getElementById("chatBody").innerHTML = `
-                        <div class="chat-message">
-                            <div class="message-bubble assistant">
-                                Hi! I'm an HR assistant. Ask me about company policies or employee benefits.
-                            </div>
-                        </div>
-                    `;
+    function resetContextDisplay() {
+        ["systemTokens","historyTokens","payloadTokens","totalTurns",
+         "windowedTurns","droppedTurns","toolMsgCount","offloadedCount","offloadedFiles"]
+            .forEach(function(id) { document.getElementById(id).textContent = "0"; });
+        document.getElementById("progressFill").style.width   = "0%";
+        document.getElementById("progressPct").textContent    = "0%";
+        document.getElementById("compressedLastTurn").textContent = "—";
+        document.getElementById("historyList").innerHTML      = "";
+        document.getElementById("payloadPreview").textContent = "";
+    }
 
-                    // Reset context display
-                    document.getElementById("systemTokens").textContent = "0";
-                    document.getElementById("historyTokens").textContent = "0";
-                    document.getElementById("payloadTokens").textContent = "0";
-                    document.getElementById("messageCount").textContent = "0";
-                    document.getElementById("windowedCount").textContent = "0";
-                    document.getElementById("droppedCount").textContent = "0";
-                    document.getElementById("progressFill").style.width = "0%";
-                    document.getElementById("historyList").innerHTML = "";
-                } catch (error) {
-                    alert("Error: " + error.message);
-                }
-            }
+    function resetChatBody() {
+        document.getElementById("chatBody").innerHTML =
+            "<div class=\"chat-message\">" +
+            "<div class=\"message-bubble assistant\">Hi! I'm an HR assistant. How can i help you? </div>" +
+            "</div>";
+    }
 
-            function handleEnter(event) {
-                if (event.key === "Enter" && !event.shiftKey) {
-                    event.preventDefault();
-                    sendMessage();
-                }
-            }
+    async function clearHistory() {
+        if (!confirm("Clear conversation history?")) return;
+        await fetch(API + "/api/clear", {method: "POST"});
+        resetChatBody();
+        resetContextDisplay();
+    }
 
-            // Initial context load
-            async function loadInitialContext() {
-                try {
-                    const response = await fetch(`${API_BASE}/api/context`);
-                    const context = await response.json();
-                    updateContext(context);
-                } catch (error) {
-                    console.error("Failed to load initial context:", error);
-                }
-            }
+    // ── Payload modal ─────────────────────────────────────────────────────────
+    function roleColor(role) {
+        return role === "system" ? "#FF9800" : role === "user" ? "#2196F3" : role === "tool" ? "#9C27B0" : "#4CAF50";
+    }
 
-            loadInitialContext();
-            document.getElementById("chatInput").focus();
-        </script>
-    </body>
-    </html>
-    """
+    function openPayloadModal() {
+        document.getElementById("payloadModal").classList.add("active");
+        var body = document.getElementById("payloadFull");
+        body.innerHTML = "";
+        fullPayload.forEach(function(msg) {
+            var w = document.createElement("div");
+            w.style.cssText = "margin-bottom:16px;border-left:3px solid " + roleColor(msg.role) + ";padding-left:10px;";
+            w.innerHTML =
+                "<div style=\"font-weight:700;font-size:11px;text-transform:uppercase;color:#888;margin-bottom:4px;\">" +
+                escapeHtml(msg.role) + " <span style=\"font-weight:400;color:#bbb;\">(" + msg.tokens + " tokens)</span></div>" +
+                "<pre style=\"margin:0;white-space:pre-wrap;word-wrap:break-word;font-size:12px;color:#444;line-height:1.5;\">" +
+                escapeHtml(msg.content || "") + "</pre>";
+            body.appendChild(w);
+        });
+    }
+
+    function closePayloadModal(event) {
+        if (event && event.target.id !== "payloadModal") return;
+        document.getElementById("payloadModal").classList.remove("active");
+    }
+
+    document.addEventListener("keydown", function(e) { if (e.key === "Escape") closePayloadModal(); });
+
+    function handleEnter(e) {
+        if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+    }
+
+    function escapeHtml(text) {
+        var d = document.createElement("div");
+        d.textContent = text || "";
+        return d.innerHTML;
+    }
+
+    // ── Init ──────────────────────────────────────────────────────────────────
+    async function init() {
+        try {
+            var res  = await fetch(API + "/api/exercise");
+            var meta = await res.json();
+            applyExerciseMeta(meta);
+            var ctxRes = await fetch(API + "/api/context");
+            var ctx    = await ctxRes.json();
+            updateContext(ctx);
+        } catch (e) {
+            console.error("Init failed:", e);
+        }
+        document.getElementById("chatInput").focus();
+    }
+
+    init();
+</script>
+</body>
+</html>"""
 
 
 if __name__ == "__main__":
+    print("\n  FAQ Agent — Context Visualization")
+    print("  Open: http://localhost:5000\n")
     app.run(debug=True, port=5000)
